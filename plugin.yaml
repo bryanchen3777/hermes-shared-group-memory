@@ -1,0 +1,7 @@
+name: shared_group_memory
+version: 1.0
+description: 後宮群聊記憶共享 — 自動記錄並廣播所有成員的群聊發言
+author: Bryan
+hooks:
+  - pre_llm_call
+  - post_llm_call
