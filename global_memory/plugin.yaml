@@ -1,0 +1,6 @@
+name: global_memory
+version: 1.0
+description: Bryan 的全域記憶（群聊 + 私聊）
+author: Bryan
+hooks:
+  - pre_llm_call

@@ -92,13 +92,12 @@ def read_shared_memory(chat_type: str, profile_name: str, limit: int = 20) -> st
             speaker = "Bryan" if is_bryan else profile
             result.append(f"[{ts_str}][{speaker}] {content.strip()}")
 
-        return "
-".join(result)
+        return "\n".join(result)
     except Exception as e:
         return f"[shared_memory read error] {e}"
 
 
-async def _pre_llm_call(**kwargs: Any) -> Dict[str, str]:
+def _pre_llm_call(**kwargs: Any) -> Dict[str, str]:
     profile = get_profile_name()
     conversation_history = kwargs.get("conversation_history", [])
     session_id = kwargs.get("session_id", "")
@@ -108,17 +107,14 @@ async def _pre_llm_call(**kwargs: Any) -> Dict[str, str]:
 
     label = "群聊" if chat_type == "group" else "私聊"
     context = (
-        f"【共享記憶 — {label}】
-"
-        f"以下是 Bryan 和所有後宮成員在{'群聊' if chat_type == 'group' else '私聊'}中說過的話：
-
-"
+        f"【共享記憶 — {label}】\n"
+        f"以下是 Bryan 和所有後宮成員在{'群聊' if chat_type == 'group' else '私聊'}中說過的話：\n\n"
         f"{recent}"
     )
     return {"context": context}
 
 
-async def _post_llm_call(**kwargs: Any) -> None:
+def _post_llm_call(**kwargs: Any) -> None:
     conversation_history = kwargs.get("conversation_history", [])
     session_id = kwargs.get("session_id", "")
 
