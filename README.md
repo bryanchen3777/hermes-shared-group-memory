@@ -21,17 +21,17 @@ Two complementary plugins that together give harem members shared awareness of a
 │        ┌──────────────┴──────────────┐                     │
 │        ▼                               ▼                     │
 │  ┌──────────────────┐    ┌──────────────────────────┐       │
-│  │ global_memory    │    │ shared_group_memory      │       │
-│  │ (reads state.db) │    │ (writes shared .db)      │       │
-│  │                  │    │                          │       │
-│  │ pre_llm_call     │    │ pre_llm_call  ◄─────────┼───►   │
-│  │                  │    │ post_llm_call            │       │
-│  └────────┬─────────┘    └──────────┬───────────────┘       │
+│  │ global_memory    │    │ shared_group_memory    │       │
+│  │ (reads state.db)│    │ (writes shared .db)  │       │
+│  │                  │    │                        │       │
+│  │ pre_llm_call    │    │ pre_llm_call ◄────────┼──►   │
+│  │                  │    │ post_llm_call          │       │
+│  └────────┬─────────┘    └──────────┬──────────────┘       │
 │           │                          │                        │
 │           ▼                          ▼                        │
 │  ┌──────────────────┐    ┌──────────────────────────┐       │
-│  │    state.db      │    │ shared_group_memory.db   │       │
-│  │ (messages table) │    │ (group_messages table)   │       │
+│  │    state.db      │    │ shared_group_memory.db │       │
+│  │ (messages table) │    │ (group_messages table) │       │
 │  └──────────────────┘    └──────────────────────────┘       │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -57,51 +57,105 @@ Two complementary plugins that together give harem members shared awareness of a
 
 ```
 ~/.hermes/
-├── plugins/
+├── plugins/                          # Root plugins (for default gateway)
 │   ├── global_memory/
-│   │   ├── __init__.py       # pre_llm_call: injects Bryan's history
+│   │   ├── __init__.py
 │   │   └── plugin.yaml
 │   └── shared_group_memory/
-│       ├── __init__.py       # pre_llm_call + post_llm_call
+│       ├── __init__.py
 │       ├── plugin.yaml
-│       └── create_table.py   # init shared_group_memory.db
+│       └── create_table.py
+├── profiles/
+│   ├── rem/
+│   │   └── plugins/                 # MUST install plugins here for rem gateway
+│   │       ├── global_memory/
+│   │       └── shared_group_memory/
+│   └── ram/
+│       └── plugins/                 # MUST install plugins here for ram gateway
+│           ├── global_memory/
+│           └── shared_group_memory/
 ├── skills/
 │   └── shared_group_memory/
 │       └── SKILL.md
-└── shared_group_memory.db    # created by create_table.py
+└── shared_group_memory.db            # created by create_table.py
 ```
+
+**IMPORTANT**: Profile gateways (`--profile rem`, `--profile ram`) only load plugins from their profile-specific `plugins/` directories. You must install plugins in both `~/.hermes/plugins/` AND `~/.hermes/profiles/{profile}/plugins/` for all gateways to use them.
+
+---
+
+## Key Implementation Detail | 關鍵實作細節
+
+### state.db Session Lookup
+
+Both plugins query `sessions` table to determine chat type:
+
+```python
+def get_chat_type(session_id: str) -> tuple[str, str]:
+    root_db = "/home/bbf/.hermes/state.db"
+    # Profile-specific state.db is checked first
+    profile_db = os.path.join(hermes_home, "state.db")  # e.g. /home/bbf/.hermes/profiles/rem/state.db
+    for db in [profile_db, root_db]:
+        conn = sqlite3.connect(db)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM sessions WHERE id = ?", (session_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return ("group", None) if row[0] is None else ("dm", row[0])
+    return ("dm", None)
+```
+
+- `sessions.user_id IS NULL` → group chat (all members see)
+- `sessions.user_id = 1696287850` (Bryan's Telegram ID) → DM
 
 ---
 
 ## Installation | 安裝
 
 ```bash
-# 1. Create plugin directories
+# 1. Install plugins in ROOT plugins directory
 mkdir -p ~/.hermes/plugins/global_memory
 mkdir -p ~/.hermes/plugins/shared_group_memory
-
-# 2. Copy plugin files
-# global_memory
 cp global_memory/__init__.py global_memory/plugin.yaml \
    ~/.hermes/plugins/global_memory/
-
-# shared_group_memory
 cp shared_group_memory/__init__.py shared_group_memory/plugin.yaml \
    shared_group_memory/create_table.py \
    ~/.hermes/plugins/shared_group_memory/
 
+# 2. ALSO install plugins in EACH profile's plugins directory
+# For rem profile:
+mkdir -p ~/.hermes/profiles/rem/plugins/global_memory
+mkdir -p ~/.hermes/profiles/rem/plugins/shared_group_memory
+cp global_memory/__init__.py global_memory/plugin.yaml \
+   ~/.hermes/profiles/rem/plugins/global_memory/
+cp shared_group_memory/__init__.py shared_group_memory/plugin.yaml \
+   shared_group_memory/create_table.py \
+   ~/.hermes/profiles/rem/plugins/shared_group_memory/
+
+# For ram profile:
+mkdir -p ~/.hermes/profiles/ram/plugins/global_memory
+mkdir -p ~/.hermes/profiles/ram/plugins/shared_group_memory
+cp global_memory/__init__.py global_memory/plugin.yaml \
+   ~/.hermes/profiles/ram/plugins/global_memory/
+cp shared_group_memory/__init__.py shared_group_memory/plugin.yaml \
+   shared_group_memory/create_table.py \
+   ~/.hermes/profiles/ram/plugins/shared_group_memory/
+
 # 3. Initialize shared DB
 python3 ~/.hermes/plugins/shared_group_memory/create_table.py
 
-# 4. Restart gateway
+# 4. Restart all gateways
 hermes gateway restart
+# Or for profile gateways:
+systemctl --user restart hermes-gateway-rem.service hermes-gateway-ram.service
 ```
 
 ---
 
 ## Database Schemas | 資料庫結構
 
-### `state.db` — messages table (built-in, read-only)
+### `state.db` — sessions + messages tables (built-in, read-only)
 
 ```sql
 SELECT m.content, m.timestamp, s.user_id
@@ -154,6 +208,7 @@ CREATE TABLE group_messages (
 - **Harem member DMs are private** — only the speaking member and Bryan can see DM content
 - **Group chat is shared** — all members see all group chat messages, creating a "living in the same group" experience
 - **Separate databases** — `global_memory` reads the built-in state.db (Bryan's history), `shared_group_memory` writes a dedicated DB (cross-member awareness)
+- **Profile plugin isolation** — each profile gateway loads plugins from its own `plugins/` directory
 
 ---
 
@@ -183,6 +238,20 @@ CREATE TABLE group_messages (
 
 ---
 
+## Changelog | 更新記錄
+
+### v1.2 (2026-04-18)
+- **Critical**: Profile gateways only load plugins from profile-specific `plugins/` directories — plugins must be installed in both `~/.hermes/plugins/` AND `~/.hermes/profiles/{profile}/plugins/`
+- Fixed: `get_state_db()` now queries profile state.db first, then root (ensures session lookup works correctly across all profiles)
+
+### v1.1 (2026-04-18)
+- Fixed: removed `async` from hook functions — was causing context injection to silently fail
+
+### v1.0 (2026-04-17)
+- Initial release with two complementary plugins
+
+---
+
 ## Plugin Manifests | Plugin 宣告
 
 ### global_memory/plugin.yaml
@@ -207,9 +276,3 @@ hooks:
   - pre_llm_call
   - post_llm_call
 ```
-
----
-
-## License
-
-MIT License © 2026 Soul Evolution 2.0 Project

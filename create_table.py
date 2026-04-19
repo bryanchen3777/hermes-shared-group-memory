@@ -15,9 +15,13 @@ c.execute("""
         content TEXT,
         is_from_bryan INTEGER DEFAULT 0,
         chat_type TEXT DEFAULT 'dm',
-        session_id TEXT
+        session_id TEXT,
+        msg_id INTEGER
     )
 """)
+
+# Unique index for deduplication: prevents same message from being inserted twice
+c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_unique ON group_messages(session_id, msg_id)")
 
 conn.commit()
 conn.close()
