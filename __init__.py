@@ -1,10 +1,18 @@
 import os
 import sqlite3
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 SHARED_DB = "/home/bbf/.hermes/shared_group_memory.db"
-TEST_DB = "/home/bbf/.hermes/shared_group_memory_test.db"
+BRYAN_ID = "1696287850"
+
+STATE_DBS = {
+    "default": "/home/bbf/.hermes/state.db",
+    "rem":    "/home/bbf/.hermes/profiles/rem/state.db",
+    "ram":    "/home/bbf/.hermes/profiles/ram/state.db",
+    "mihiru": "/home/bbf/.hermes/profiles/mihiru/state.db",
+}
+
 
 def get_profile_name() -> str:
     hermes_home = os.environ.get("HERMES_HOME", "")
@@ -12,93 +20,145 @@ def get_profile_name() -> str:
         return hermes_home.rstrip("/").split("/")[-1]
     return "default"
 
-# Always write on register to confirm plugin loaded
-_conn = sqlite3.connect(TEST_DB)
-_c = _conn.cursor()
-_c.execute("""
-    CREATE TABLE IF NOT EXISTS ping_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event TEXT,
-        profile TEXT,
-        ts TEXT
-    )
-""")
-_c.execute("INSERT INTO ping_log (event, profile, ts) VALUES (?, ?, ?)",
-    ("register_called", get_profile_name(), datetime.now().isoformat()))
-_conn.commit()
-_conn.close()
 
-def get_chat_type(session_id: str) -> tuple[str, str]:
-    root_db = "/home/bbf/.hermes/state.db"
-    profile_db = None
-    hermes_home = os.environ.get("HERMES_HOME", "")
-    if "/profiles/" in hermes_home:
-        candidate = os.path.join(hermes_home, "state.db")
-        if os.path.exists(candidate):
-            profile_db = candidate
-    for db in ([profile_db, root_db] if profile_db else [root_db]):
+def get_chat_type(session_id: str) -> Tuple[str, str | None]:
+    """session_id 出現在 2+ profile = 群組聊天"""
+    if not session_id:
+        return ("dm", None)
+    profiles_with_session = []
+    user_id = None
+    for profile, db_path in STATE_DBS.items():
+        if not os.path.exists(db_path):
+            continue
         try:
-            conn = sqlite3.connect(db)
+            conn = sqlite3.connect(db_path, timeout=5)
             c = conn.cursor()
             c.execute("SELECT user_id FROM sessions WHERE id = ?", (session_id,))
             row = c.fetchone()
+            if row is not None:
+                profiles_with_session.append(profile)
+                if user_id is None:
+                    user_id = row[0]
             conn.close()
-            if row:
-                return ("group", None) if row[0] is None else ("dm", row[0])
         except Exception:
             pass
-    return ("dm", None)
+    if len(profiles_with_session) >= 2:
+        return ("group", None)
+    if user_id is None:
+        return ("dm", None)
+    return ("dm", str(user_id) if user_id is not None else None)
 
-def write_messages(session_id: str, conversation_history: list) -> None:
-    profile = get_profile_name()
-    chat_type, _ = get_chat_type(session_id)
+
+def sync_from_state_db() -> None:
+    my_profile = get_profile_name()
+    dbs_to_scan = [("/home/bbf/.hermes/state.db", "root")]
+    if my_profile != "default":
+        profile_db_path = f"/home/bbf/.hermes/profiles/{my_profile}/state.db"
+        if os.path.exists(profile_db_path):
+            dbs_to_scan.append((profile_db_path, my_profile))
+    for db_path, source in dbs_to_scan:
+        _sync_single_db(db_path, source, my_profile)
+
+
+def _sync_single_db(db_path: str, source: str, my_profile: str) -> None:
     try:
-        conn = sqlite3.connect(TEST_DB)
-        c = conn.cursor()
-        c.execute("INSERT INTO ping_log (event, profile, ts) VALUES (?, ?, ?)",
-            (f"write_messages session={session_id[:20]} msgs={len(conversation_history)}",
-             f"{profile}/{chat_type}", datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+        src_conn = sqlite3.connect(db_path, timeout=10)
+        src_conn.row_factory = sqlite3.Row
     except Exception:
-        pass
+        return
     try:
-        conn = sqlite3.connect(SHARED_DB)
-        c = conn.cursor()
-        for msg in conversation_history:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if not content or len(content) < 2:
-                continue
+        shared_conn = sqlite3.connect(SHARED_DB, timeout=10)
+        shared_conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        src_conn.close()
+        return
+    try:
+        sessions = {}
+        rows = src_conn.execute("SELECT id, user_id FROM sessions").fetchall()
+        for row in rows:
+            sessions[row["id"]] = row["user_id"]
+        if not sessions:
+            src_conn.close()
+            shared_conn.close()
+            return
+        session_ids = list(sessions.keys())
+        placeholders = ",".join(["?"] * len(session_ids))
+        query = f"""
+            SELECT m.id, m.session_id, m.role, m.content, m.timestamp
+            FROM messages m
+            WHERE m.session_id IN ({placeholders})
+              AND m.role IN ('user', 'assistant')
+              AND m.content IS NOT NULL
+              AND LENGTH(m.content) > 1
+            ORDER BY m.id DESC
+            LIMIT 2000
+        """
+        messages = src_conn.execute(query, session_ids).fetchall()
+        if not messages:
+            src_conn.close()
+            shared_conn.close()
+            return
+        shared_c = shared_conn.cursor()
+        for msg in messages:
+            msg_id = msg["id"]
+            session_id = msg["session_id"]
+            role = msg["role"]
+            content = msg["content"]
+            ts = msg["timestamp"] or datetime.now().timestamp()
+
+            chat_type, _ = get_chat_type(session_id)
+
+            # recipient 寫入邏輯：
+            # Bryan → 群聊：recipient="all"（所有 Bot 可見）
+            # Bryan → 單一 Bot DM：recipient=my_profile（只有該 Bot 可見）
+            # Agent → Bryan：recipient="Bryan"
             if role == "user":
-                c.execute(
-                    "INSERT INTO group_messages (timestamp, profile_name, content, is_from_bryan, chat_type, session_id) VALUES (?, ?, ?, ?, ?, ?)",
-                    (datetime.now().timestamp(), "Bryan", content[:200], 1, chat_type, session_id)
-                )
-            elif role == "assistant":
-                c.execute(
-                    "INSERT INTO group_messages (timestamp, profile_name, content, is_from_bryan, chat_type, session_id) VALUES (?, ?, ?, ?, ?, ?)",
-                    (datetime.now().timestamp(), profile, content[:200], 0, chat_type, session_id)
-                )
-        conn.commit()
-        conn.close()
+                profile_name = "Bryan"
+                is_from_bryan = 1
+                recipient = "all" if chat_type == "group" else my_profile
+            else:
+                profile_name = my_profile
+                is_from_bryan = 0
+                recipient = "Bryan"
+
+            try:
+                shared_c.execute("""
+                    INSERT OR IGNORE INTO group_messages
+                        (timestamp, profile_name, content, is_from_bryan, chat_type, session_id, msg_id, recipient)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (ts, profile_name, content[:500], is_from_bryan, chat_type, session_id, msg_id, recipient))
+            except Exception:
+                pass
+        shared_conn.commit()
+        shared_conn.close()
+        src_conn.close()
     except Exception:
-        pass
+        try:
+            src_conn.close()
+            shared_conn.close()
+        except Exception:
+            pass
+
 
 def read_shared_memory(chat_type: str, profile_name: str, limit: int = 20) -> str:
+    """讀取：群聊全公開，私聊只有自己說的 + Bryan 對自己說的"""
     try:
         conn = sqlite3.connect(SHARED_DB)
         c = conn.cursor()
         if chat_type == "group":
-            c.execute(
-                "SELECT timestamp, profile_name, content, is_from_bryan FROM group_messages WHERE chat_type='group' ORDER BY id DESC LIMIT ?",
-                (limit,)
-            )
+            c.execute("""
+                SELECT timestamp, profile_name, content, is_from_bryan
+                FROM group_messages
+                WHERE chat_type='group'
+                ORDER BY id DESC LIMIT ?
+            """, (limit,))
         else:
-            c.execute(
-                "SELECT timestamp, profile_name, content, is_from_bryan FROM group_messages WHERE chat_type='dm' AND (profile_name=? OR profile_name='Bryan') ORDER BY id DESC LIMIT ?",
-                (profile_name, limit)
-            )
+            c.execute("""
+                SELECT timestamp, profile_name, content, is_from_bryan
+                FROM group_messages
+                WHERE chat_type='dm' AND (profile_name=? OR (profile_name='Bryan' AND recipient=?))
+                ORDER BY id DESC LIMIT ?
+            """, (profile_name, profile_name, limit))
         rows = c.fetchall()
         conn.close()
         if not rows:
@@ -107,12 +167,14 @@ def read_shared_memory(chat_type: str, profile_name: str, limit: int = 20) -> st
         for ts, profile, content, is_bryan in rows:
             ts_str = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else ""
             speaker = "Bryan" if is_bryan else profile
-            result.append(f"[{ts_str}][{speaker}] {content.strip()}")
+            result.append(f"[{ts_str}][{speaker}] {content.strip()[:100]}")
         return "\n".join(result)
     except Exception:
         return "（共享記憶目前是空的）"
 
+
 def _pre_llm_call(**kwargs: Any) -> Dict[str, str]:
+    sync_from_state_db()
     profile = get_profile_name()
     session_id = kwargs.get("session_id", "")
     chat_type, _ = get_chat_type(session_id)
@@ -125,21 +187,10 @@ def _pre_llm_call(**kwargs: Any) -> Dict[str, str]:
     )
     return {"context": context}
 
+
 def _post_llm_call(**kwargs: Any) -> None:
-    conversation_history = kwargs.get("conversation_history", [])
-    session_id = kwargs.get("session_id", "")
-    try:
-        conn = sqlite3.connect(TEST_DB)
-        c = conn.cursor()
-        c.execute("INSERT INTO ping_log (event, profile, ts) VALUES (?, ?, ?)",
-            (f"post_llm_called session={session_id[:20] if session_id else 'none'} msgs={len(conversation_history)}",
-             get_profile_name(), datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-    if conversation_history and session_id:
-        write_messages(session_id, conversation_history)
+    sync_from_state_db()
+
 
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _pre_llm_call)
